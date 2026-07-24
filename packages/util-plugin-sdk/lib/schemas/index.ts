@@ -101,3 +101,5 @@ export const RivenPluginPackage = z.object({
 export type RivenPluginPackage = z.infer<typeof RivenPluginPackage>;
 
 export { getEventTypeFromSchema } from "./utilities/get-event-type-from-schema.ts";
+
+export * from "./datasource-settings.schema.ts";
