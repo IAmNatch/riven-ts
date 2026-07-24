@@ -1,3 +1,5 @@
+import { datasourceSettingsShape } from "../schemas/datasource-settings.schema.ts";
+
 import type { Jsonifiable, ReadonlyDeep } from "type-fest";
 import type { Logger } from "winston";
 import type { z, ZodObject } from "zod";
@@ -160,11 +162,18 @@ export class PluginSettings {
       );
     }
 
-    const parsedSettings = schema.parse(
-      Object.fromEntries(
-        [...rawPluginSettings].map(([key, value]) => [key, value]),
-      ),
-    );
+    // Merge the shared, env-configurable datasource settings into every
+    // plugin's schema so that keys like `datasourceConcurrency` are parsed for
+    // all plugins without each plugin having to re-declare them. The parsed
+    // result is still keyed by the plugin's original `schema`, so callers that
+    // `get(plugin.settingsSchema)` continue to work unchanged.
+    const parsedSettings = schema
+      .extend(datasourceSettingsShape)
+      .parse(
+        Object.fromEntries(
+          [...rawPluginSettings].map(([key, value]) => [key, value]),
+        ),
+      );
 
     this.#settingsMap.set(schema, parsedSettings);
 
