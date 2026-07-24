@@ -11,6 +11,10 @@ import { URL } from "node:url";
 import z from "zod";
 
 import { benchmark } from "../helpers/benchmark.ts";
+import {
+  DatasourceSettings,
+  resolveRateLimiterOptions,
+} from "../schemas/datasource-settings.schema.ts";
 import { json } from "../validation/json.ts";
 import { urlSearchParamsCodec } from "../validation/url-search-params-parser.ts";
 import { dataSourceContext } from "./context.ts";
@@ -42,6 +46,15 @@ interface FetchJobInput {
    */
   bodyType: "json" | "url-search-params" | undefined;
   params: string;
+  /**
+   * The number of times this job has been re-queued after receiving an HTTP 429
+   * (Too Many Requests) response. Used to bound rate-limit retries so a
+   * persistently rate-limited endpoint is not retried forever.
+   *
+   * Persisted on the job (via `job.updateData`) so the count survives each
+   * re-queue. Absent/`undefined` is treated as `0`.
+   */
+  rateLimitRetries?: number;
 }
 
 type FetchResponse<T = unknown> = Pick<
@@ -88,6 +101,36 @@ export interface BaseDataSourceConfig<
   connection: ConnectionOptions;
   telemetry: Telemetry;
   userAgent: string;
+  /**
+   * Per-datasource code-level override for the worker concurrency.
+   *
+   * Because subclass field initializers only run *after* `super()` returns —
+   * by which point the worker has already been constructed — datasource
+   * subclasses must pass their concurrency override here rather than declaring
+   * it as a class field.
+   *
+   * Precedence (increasing): base default (200) < this override < env setting
+   * (`datasourceConcurrency`).
+   */
+  concurrency?: number;
+  /**
+   * Per-datasource code-level override for the queue rate limiter.
+   *
+   * Must be passed through the constructor (not a subclass field) for the same
+   * ordering reason as {@link concurrency}.
+   *
+   * Precedence (increasing): base default (none) < this override < env setting
+   * (`datasourceRateLimitMax` / `datasourceRateLimitDuration`).
+   */
+  rateLimiterOptions?: RateLimiterOptions;
+  /**
+   * Per-datasource code-level override for the maximum number of rate-limit
+   * (HTTP 429) retries before a request is abandoned.
+   *
+   * Precedence (increasing): base default (5) < this override < env setting
+   * (`datasourceMaxRateLimitRetries`).
+   */
+  maxRateLimitRetries?: number;
 }
 
 export abstract class BaseDataSource<
@@ -100,6 +143,19 @@ export abstract class BaseDataSource<
 
   public override readonly logger: Logger;
 
+  /**
+   * The effective queue rate limiter options for this datasource.
+   *
+   * Resolved in the constructor (before the worker is built) from the base
+   * default (none/unthrottled), the per-datasource code override
+   * ({@link BaseDataSourceConfig.rateLimiterOptions}), and the per-plugin env
+   * settings (`datasourceRateLimitMax` / `datasourceRateLimitDuration`), in
+   * increasing order of precedence.
+   *
+   * NOTE: this MUST be resolved via the constructor config — a subclass field
+   * initializer would run only after `super()` (and the worker) has already
+   * been built, so field-level overrides never reach the worker.
+   */
   protected readonly rateLimiterOptions?: RateLimiterOptions | undefined;
 
   /**
@@ -111,11 +167,33 @@ export abstract class BaseDataSource<
    *
    * If your API throws a lot of timeout errors, try reducing this value.
    *
+   * Resolved in the constructor from the base default, the per-datasource code
+   * override ({@link BaseDataSourceConfig.concurrency}) and the per-plugin env
+   * setting (`datasourceConcurrency`), in increasing order of precedence.
+   *
    * @see https://docs.bullmq.io/guide/parallelism-and-concurrency#how-to-best-use-bullmqs-concurrency-then
    *
    * @default 200
    */
-  protected readonly concurrency: number = 200;
+  protected readonly concurrency: number;
+
+  /**
+   * The maximum number of times a single request is re-queued after receiving
+   * an HTTP 429 (Too Many Requests) response before it is abandoned.
+   *
+   * This bounds rate-limit retries so that a persistently rate-limited endpoint
+   * cannot be retried forever (which would also keep the upstream IP throttled).
+   * Once exceeded, the request fails terminally and the caller's error handling
+   * proceeds.
+   *
+   * Resolved in the constructor from the base default, the per-datasource code
+   * override ({@link BaseDataSourceConfig.maxRateLimitRetries}) and the
+   * per-plugin env setting (`datasourceMaxRateLimitRetries`), in increasing
+   * order of precedence.
+   *
+   * @default 5
+   */
+  protected readonly maxRateLimitRetries: number;
 
   readonly #requestAttempts: number;
   readonly #requestBackoffDelay: number;
@@ -143,6 +221,9 @@ export abstract class BaseDataSource<
     settings,
     requestAttempts = 3,
     requestBackoffDelay = 10_000,
+    concurrency,
+    rateLimiterOptions,
+    maxRateLimitRetries,
     connection,
     telemetry,
     userAgent,
@@ -155,6 +236,31 @@ export abstract class BaseDataSource<
     this.serviceName = this.constructor.name;
     this.#requestAttempts = requestAttempts;
     this.#requestBackoffDelay = requestBackoffDelay;
+
+    // Resolve datasource knobs BEFORE the worker is built.
+    //
+    // Precedence (increasing): base default < per-datasource code override
+    // (constructor config) < per-plugin env setting (parsed out of `settings`).
+    //
+    // These MUST flow through the constructor: a subclass field initializer
+    // runs only after `super()` returns, by which point the worker below has
+    // already read `this.concurrency` / `this.rateLimiterOptions`, so field
+    // overrides would silently never take effect.
+    const datasourceSettings =
+      DatasourceSettings.safeParse(settings).data ?? {};
+
+    this.concurrency =
+      datasourceSettings.datasourceConcurrency ?? concurrency ?? 200;
+    this.maxRateLimitRetries =
+      datasourceSettings.datasourceMaxRateLimitRetries ??
+      maxRateLimitRetries ??
+      5;
+    this.rateLimiterOptions = resolveRateLimiterOptions(
+      rateLimiterOptions,
+      datasourceSettings.datasourceRateLimitMax,
+      datasourceSettings.datasourceRateLimitDuration,
+    );
+
     this.#queueId = `${pluginSymbol.description ?? "unknown"}-${this.serviceName}-fetch-queue`;
     this.queue = new Queue(this.#queueId, {
       connection,
@@ -210,6 +316,40 @@ export abstract class BaseDataSource<
             responseFromCache,
           };
         } catch (error) {
+          // A RateLimitError is thrown from `didEncounterRateLimit` on HTTP 429.
+          // BullMQ re-queues these WITHOUT consuming an attempt (via
+          // `moveLimitedBackToWait`), so without an explicit ceiling a
+          // persistently rate-limited endpoint would be retried forever — and
+          // the retries themselves keep the upstream IP throttled, so it never
+          // self-clears. Bound the number of re-queues with a dedicated,
+          // persisted counter.
+          if (error instanceof RateLimitError) {
+            const rateLimitRetries = job.data.rateLimitRetries ?? 0;
+
+            if (rateLimitRetries >= this.maxRateLimitRetries) {
+              this.logger.warn(
+                `[${this.serviceName}] giving up after ${rateLimitRetries.toString()} rate-limit retries for ${job.data.path}`,
+              );
+
+              // UnrecoverableError fails the job terminally regardless of
+              // remaining attempts, so `fetch`'s `waitUntilFinished` rejects and
+              // the caller's error handling proceeds gracefully.
+              throw new UnrecoverableError(
+                `[${this.serviceName}] Exceeded maximum rate-limit retries (${this.maxRateLimitRetries.toString()}) for ${job.data.path}`,
+              );
+            }
+
+            // Persist the incremented counter BEFORE rethrowing so it survives
+            // the re-queue, then rethrow the RateLimitError so BullMQ routes it
+            // through `moveLimitedBackToWait` (no attempt consumed).
+            await job.updateData({
+              ...job.data,
+              rateLimitRetries: rateLimitRetries + 1,
+            });
+
+            throw error;
+          }
+
           const hasRemainingAttempts =
             job.attemptsStarted !== this.#requestAttempts;
 

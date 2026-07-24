@@ -2,7 +2,7 @@ import { BaseDataSource, getStremioScrapeConfig } from "@repo/util-plugin-sdk";
 import { z } from "@repo/util-plugin-sdk/validation";
 
 import type { TorrentioSettings } from "../torrentio-settings.schema.ts";
-import type { ParamsFor, RateLimiterOptions } from "@repo/util-plugin-sdk";
+import type { BaseDataSourceConfig, ParamsFor } from "@repo/util-plugin-sdk";
 import type { MediaItemScrapeRequestedEvent } from "@repo/util-plugin-sdk/schemas/events/media-item.scrape-requested.event";
 
 const TorrentioScrapeResponse = z.object({
@@ -26,10 +26,23 @@ export class TorrentioAPI extends BaseDataSource<TorrentioSettings> {
     return this.settings.filter;
   }
 
-  protected override rateLimiterOptions: RateLimiterOptions = {
-    max: 150,
-    duration: 60 * 1000,
-  };
+  public constructor(config: BaseDataSourceConfig<TorrentioSettings>) {
+    // Torrentio (torrentio.strem.fun) enforces a strict per-IP rate limit.
+    //
+    // These overrides MUST be passed through the constructor rather than
+    // declared as class fields: a subclass field initializer runs only after
+    // `super()` (and the worker) has already been built, so a field-level
+    // override would never reach the worker and the datasource would run
+    // unthrottled at the default concurrency of 200.
+    //
+    // The limiter (not concurrency) is the binding constraint: concurrency is
+    // kept above the per-window release rate so the limiter gates throughput.
+    super({
+      ...config,
+      rateLimiterOptions: { max: 2, duration: 1000 },
+      concurrency: 4,
+    });
+  }
 
   public override async validate() {
     try {
