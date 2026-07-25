@@ -56,6 +56,41 @@ export const datasourceSettingsShape = {
       "How many times a single request is re-queued after receiving an HTTP 429 (Too Many Requests) response before it is abandoned. Prevents a persistently rate-limited endpoint from being retried forever. Defaults to 5. Applies to every datasource exposed by the plugin.",
     )
     .meta({ "wiki.section": "datasource" }),
+  datasourceBreakerThreshold: z.coerce
+    .number()
+    .int()
+    .optional()
+    .describe(
+      "How many *consecutive* HTTP 429 responses across all of this plugin's datasource requests trip the circuit breaker, which then pauses ALL upstream requests for a cooldown. This bounds the aggregate request rate during a backfill so a persistently rate-limited upstream is left quiet long enough to lift a per-IP ban. Set to 0 (or a negative value) to disable the breaker entirely. Defaults to 5. Applies to every datasource exposed by the plugin.",
+    )
+    .meta({ "wiki.section": "datasource" }),
+  datasourceBreakerCooldownSeconds: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe(
+      "The base circuit-breaker cooldown, in seconds, applied the first time the breaker trips. Each subsequent trip that happens before the datasource recovers doubles the cooldown (escalating backoff), capped at `datasourceBreakerMaxCooldownSeconds`. Defaults to 300 (5 minutes). Applies to every datasource exposed by the plugin.",
+    )
+    .meta({ "wiki.section": "datasource" }),
+  datasourceBreakerMaxCooldownSeconds: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe(
+      "The ceiling, in seconds, for the escalating circuit-breaker cooldown. Defaults to 7200 (2 hours). Applies to every datasource exposed by the plugin.",
+    )
+    .meta({ "wiki.section": "datasource" }),
+  datasourceMaxRateLimitBackoffSeconds: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe(
+      "The ceiling, in seconds, for the escalating backoff applied to a single request after an HTTP 429 response that carries no (or an invalid) `Retry-After` header. The wait starts at 10s and doubles per consecutive 429, capped at this value. A valid `Retry-After` header is always honoured as-is instead. Defaults to 300 (5 minutes). Applies to every datasource exposed by the plugin.",
+    )
+    .meta({ "wiki.section": "datasource" }),
 } as const;
 
 export const DatasourceSettings = z.object(datasourceSettingsShape);
