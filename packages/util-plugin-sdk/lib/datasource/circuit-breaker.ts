@@ -14,8 +14,20 @@ interface RecordRateLimitResult {
   consecutive429s: number;
   /**
    * Whether this 429 tripped the breaker (moved it from closed to open).
+   * Mutually exclusive with {@link alreadyOpen}.
    */
   tripped: boolean;
+  /**
+   * Whether this 429 landed while the breaker was ALREADY open — i.e. a
+   * "straggler": a request that was in flight past the worker gate when an
+   * earlier 429 tripped the breaker. Such 429s are deliberately NOT counted
+   * toward a fresh trip and do NOT escalate the level or extend the open key's
+   * TTL; the caller should simply defer the job for the remaining cooldown.
+   * This is what keeps "one trip = one level bump": escalation only ever
+   * happens on the genuine half-open probe once the open key has expired.
+   * Mutually exclusive with {@link tripped}.
+   */
+  alreadyOpen: boolean;
   /**
    * When {@link tripped}, the cooldown (in ms) the breaker opened for. `0`
    * otherwise.
@@ -87,6 +99,13 @@ export const CIRCUIT_BREAKER_SUCCESS_STREAK_TO_RESET_LEVEL = 10;
  * *immediately* at the next escalation level if the upstream is still banning
  * us — a recently-banned scraper should back off hard rather than waste another
  * full base-threshold streak of requests re-provoking the ban.
+ *
+ * This escalated threshold only ever applies to that half-open probe, i.e. a
+ * 429 seen AFTER the open key has expired. 429s that arrive *while the breaker
+ * is still open* (in-flight stragglers that passed the worker gate before the
+ * trip) are short-circuited earlier in {@link RECORD_RATE_LIMIT_SCRIPT} and
+ * never reach this threshold, so a single trip bumps the level by exactly one
+ * regardless of how many stragglers land during the open window.
  */
 const CIRCUIT_BREAKER_ESCALATED_TRIP_THRESHOLD = 1;
 
@@ -111,18 +130,34 @@ const CIRCUIT_BREAKER_COUNTER_TTL_MS = 60 * 60 * 1000;
  * race-free across the many jobs a worker processes concurrently, so a burst of
  * simultaneous 429s cannot slip past the threshold.
  *
+ * If the breaker is ALREADY open (`PTTL(open) > 0`) the 429 is a straggler — a
+ * request that was already in flight past the worker gate when an earlier 429
+ * tripped the breaker. It is recorded as "already open" and short-circuits
+ * BEFORE any counting or trip/escalation logic: the counter is left untouched
+ * (it was zeroed on the trip), the level is unchanged, and the open key's TTL
+ * is NOT reset or extended. This is what prevents stragglers from re-escalating
+ * during a single cooldown — escalation can only happen on the genuine
+ * half-open probe once the open key has expired, so one trip bumps the level by
+ * exactly one.
+ *
  * KEYS: [consecutive, open, level, success]
  * ARGV: [baseThreshold, escalatedThreshold, baseCooldownMs, maxCooldownMs,
  *        levelTtlMs, counterTtlMs, enabled]
- * Returns: {consecutive429s, tripped(1|0), cooldownMs, level}
+ * Returns: {consecutive429s, tripped(1|0), cooldownMs, level, alreadyOpen(1|0)}
  */
 const RECORD_RATE_LIMIT_SCRIPT = `
+if redis.call('PTTL', KEYS[2]) > 0 then
+  local level = tonumber(redis.call('GET', KEYS[3]) or '0')
+  local consecutive = tonumber(redis.call('GET', KEYS[1]) or '0')
+  return {consecutive, 0, 0, level, 1}
+end
+
 local consecutive = redis.call('INCR', KEYS[1])
 redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[6]))
 redis.call('DEL', KEYS[4])
 
 if tonumber(ARGV[7]) == 0 then
-  return {consecutive, 0, 0, 0}
+  return {consecutive, 0, 0, 0, 0}
 end
 
 local level = tonumber(redis.call('GET', KEYS[3]) or '0')
@@ -134,7 +169,7 @@ else
 end
 
 if consecutive < threshold then
-  return {consecutive, 0, 0, level}
+  return {consecutive, 0, 0, level, 0}
 end
 
 local newLevel = level + 1
@@ -150,7 +185,7 @@ redis.call('SET', KEYS[3], newLevel, 'PX', tonumber(ARGV[5]))
 redis.call('SET', KEYS[1], 0)
 redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[6]))
 
-return {consecutive, 1, cooldown, newLevel}
+return {consecutive, 1, cooldown, newLevel, 0}
 `;
 
 /**
@@ -250,6 +285,11 @@ export class DatasourceCircuitBreaker {
    * Records an upstream 429 and, when enabled, trips the breaker if the
    * consecutive-429 threshold is reached. The caller is responsible for logging
    * an operator-visible warning when the returned result has `tripped: true`.
+   *
+   * If the breaker is already open the 429 is treated as a straggler: the
+   * result has `alreadyOpen: true` (and `tripped: false`), nothing is counted
+   * or escalated, and the open key's TTL is left intact. The caller should
+   * defer the job for the remaining cooldown without re-logging a trip.
    */
   public async recordRateLimit(): Promise<RecordRateLimitResult> {
     const client = await this.#client;
@@ -269,13 +309,14 @@ export class DatasourceCircuitBreaker {
       String(CIRCUIT_BREAKER_COUNTER_TTL_MS),
       this.enabled ? "1" : "0",
       // Lua integer returns arrive as JS numbers over ioredis.
-    )) as [number, number, number, number];
+    )) as [number, number, number, number, number];
 
-    const [consecutive429s, tripped, cooldownMs, level] = raw;
+    const [consecutive429s, tripped, cooldownMs, level, alreadyOpen] = raw;
 
     return {
       consecutive429s,
       tripped: tripped === 1,
+      alreadyOpen: alreadyOpen === 1,
       cooldownMs,
       level,
     };

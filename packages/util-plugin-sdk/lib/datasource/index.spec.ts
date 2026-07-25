@@ -11,6 +11,7 @@ import {
   resolveRateLimiterOptions,
 } from "../schemas/datasource-settings.schema.ts";
 import { PluginSettings } from "../utilities/plugin-settings.ts";
+import { DatasourceCircuitBreaker } from "./circuit-breaker.ts";
 import { BaseDataSource } from "./index.ts";
 
 import type { BaseDataSourceConfig } from "./index.ts";
@@ -601,6 +602,79 @@ describe("circuit breaker", () => {
       );
 
       await instanceB.worker.close();
+    },
+  );
+
+  it(
+    "does not escalate or extend the cooldown on straggler 429s while already open",
+    { timeout: 30_000 },
+    async ({ redisClient }) => {
+      // Unit-test the breaker directly against the Redis fixture: this isolates
+      // the straggler behaviour (in-flight 429s that land AFTER the breaker has
+      // already opened) without racing a real worker's concurrency gate.
+      const keyPrefix = `bull:test-${randomUUID()}:circuit-breaker`;
+      const openKey = `${keyPrefix}:open`;
+      const levelKey = `${keyPrefix}:level`;
+
+      const breaker = new DatasourceCircuitBreaker({
+        client: Promise.resolve(redisClient.client),
+        keyPrefix,
+        threshold: 2,
+        baseCooldownMs: 1000,
+        maxCooldownMs: 3_600_000,
+      });
+
+      // Two consecutive 429s trip the breaker: level 0 -> 1, open for 1s.
+      const first = await breaker.recordRateLimit();
+
+      expect(first.tripped).toBe(false);
+      expect(first.alreadyOpen).toBe(false);
+
+      const trip = await breaker.recordRateLimit();
+
+      expect(trip.tripped).toBe(true);
+      expect(trip.alreadyOpen).toBe(false);
+      expect(trip.level).toBe(1);
+      expect(trip.cooldownMs).toBe(1000);
+      await expect(redisClient.client.get(levelKey)).resolves.toBe("1");
+
+      // Let the open key's TTL visibly decay so a (buggy) reset back to the full
+      // cooldown would be detectable as an INCREASE below.
+      await sleep(80);
+
+      const pttlBeforeStragglers = await redisClient.client.pttl(openKey);
+
+      expect(pttlBeforeStragglers).toBeGreaterThan(0);
+
+      // Simulate several in-flight stragglers landing 429s while still open.
+      for (let index = 0; index < 4; index += 1) {
+        const straggler = await breaker.recordRateLimit();
+
+        expect(straggler.alreadyOpen).toBe(true);
+        expect(straggler.tripped).toBe(false);
+        // Level is unchanged: no escalation while open.
+        expect(straggler.level).toBe(1);
+      }
+
+      // The level key is untouched and the open key's TTL was neither reset nor
+      // extended (it can only have decayed further).
+      await expect(redisClient.client.get(levelKey)).resolves.toBe("1");
+
+      const pttlAfterStragglers = await redisClient.client.pttl(openKey);
+
+      expect(pttlAfterStragglers).toBeGreaterThan(0);
+      expect(pttlAfterStragglers).toBeLessThanOrEqual(pttlBeforeStragglers);
+
+      // Once the open key expires, the genuine half-open probe DOES escalate:
+      // level 1 -> 2 (escalated threshold of 1 re-trips immediately).
+      await waitFor(async () => (await redisClient.client.pttl(openKey)) <= 0);
+
+      const probe = await breaker.recordRateLimit();
+
+      expect(probe.tripped).toBe(true);
+      expect(probe.alreadyOpen).toBe(false);
+      expect(probe.level).toBe(2);
+      await expect(redisClient.client.get(levelKey)).resolves.toBe("2");
     },
   );
 });
