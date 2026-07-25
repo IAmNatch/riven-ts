@@ -874,8 +874,27 @@ export abstract class BaseDataSource<
     // Record the 429 against the circuit breaker. This both drives the
     // trip/escalation logic and returns the running consecutive-429 count used
     // to scale the no-`Retry-After` backoff.
-    const { consecutive429s, tripped, cooldownMs, level } =
+    const { consecutive429s, tripped, alreadyOpen, cooldownMs, level } =
       await this.#circuitBreaker.recordRateLimit();
+
+    // Straggler 429: a request that was already in flight past the worker gate
+    // when an earlier 429 tripped the breaker. The breaker is already open at
+    // its current level; do NOT re-trip, re-escalate, or extend the open key's
+    // TTL. Freeze this job for whatever cooldown remains and re-queue it, just
+    // as the worker gate does for jobs that never left the queue — WITHOUT
+    // re-logging "breaker OPEN" at the trip (warn) level.
+    if (alreadyOpen) {
+      const remainingCooldownMs =
+        await this.#circuitBreaker.remainingCooldownMs();
+
+      await this.queue.rateLimit(Math.max(remainingCooldownMs, 1));
+
+      this.logger.debug(
+        `[${this.serviceName}] circuit breaker already OPEN — straggler 429 for ${response.url} deferred for ${Duration.fromMillis(remainingCooldownMs).rescale().toHuman()} without escalating`,
+      );
+
+      throw Worker.RateLimitError();
+    }
 
     if (tripped) {
       // Freeze the ENTIRE queue for the full cooldown immediately; subsequent
