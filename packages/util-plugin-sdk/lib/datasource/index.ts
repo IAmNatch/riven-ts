@@ -17,6 +17,10 @@ import {
 } from "../schemas/datasource-settings.schema.ts";
 import { json } from "../validation/json.ts";
 import { urlSearchParamsCodec } from "../validation/url-search-params-parser.ts";
+import {
+  CIRCUIT_BREAKER_SUCCESS_STREAK_TO_RESET_LEVEL,
+  DatasourceCircuitBreaker,
+} from "./circuit-breaker.ts";
 import { dataSourceContext } from "./context.ts";
 
 import type {
@@ -131,6 +135,41 @@ export interface BaseDataSourceConfig<
    * (`datasourceMaxRateLimitRetries`).
    */
   maxRateLimitRetries?: number;
+  /**
+   * Per-datasource code-level override for how many *consecutive* HTTP 429
+   * responses (across all requests on the fetch queue) trip the circuit
+   * breaker. `0` or negative disables the breaker.
+   *
+   * Precedence (increasing): base default (5) < this override < env setting
+   * (`datasourceBreakerThreshold`).
+   */
+  breakerThreshold?: number;
+  /**
+   * Per-datasource code-level override for the base circuit-breaker cooldown,
+   * in seconds (doubles per escalation level up to
+   * {@link breakerMaxCooldownSeconds}).
+   *
+   * Precedence (increasing): base default (300) < this override < env setting
+   * (`datasourceBreakerCooldownSeconds`).
+   */
+  breakerCooldownSeconds?: number;
+  /**
+   * Per-datasource code-level override for the escalating cooldown ceiling, in
+   * seconds.
+   *
+   * Precedence (increasing): base default (7200) < this override < env setting
+   * (`datasourceBreakerMaxCooldownSeconds`).
+   */
+  breakerMaxCooldownSeconds?: number;
+  /**
+   * Per-datasource code-level override for the ceiling, in seconds, of the
+   * escalating per-request 429 backoff used when no `Retry-After` header is
+   * present.
+   *
+   * Precedence (increasing): base default (300) < this override < env setting
+   * (`datasourceMaxRateLimitBackoffSeconds`).
+   */
+  maxRateLimitBackoffSeconds?: number;
 }
 
 export abstract class BaseDataSource<
@@ -195,6 +234,26 @@ export abstract class BaseDataSource<
    */
   protected readonly maxRateLimitRetries: number;
 
+  /**
+   * The per-fetch-queue circuit breaker. Trips after a configurable number of
+   * consecutive upstream 429s and pauses ALL upstream requests for an
+   * escalating cooldown, breaking the queue-level "metronome" that keeps a
+   * per-IP ban refreshed during a large backfill.
+   *
+   * @see {@link DatasourceCircuitBreaker}
+   */
+  readonly #circuitBreaker: DatasourceCircuitBreaker;
+
+  /**
+   * Ceiling, in ms, for the escalating per-request 429 backoff applied when a
+   * 429 response carries no (or an invalid) `Retry-After` header. The wait
+   * starts at 10s and doubles per consecutive 429 up to this cap.
+   *
+   * Resolved in the constructor with the usual precedence (base default (5 min)
+   * < code override < env setting `datasourceMaxRateLimitBackoffSeconds`).
+   */
+  readonly #maxRateLimitBackoffMs: number;
+
   readonly #requestAttempts: number;
   readonly #requestBackoffDelay: number;
 
@@ -224,6 +283,10 @@ export abstract class BaseDataSource<
     concurrency,
     rateLimiterOptions,
     maxRateLimitRetries,
+    breakerThreshold,
+    breakerCooldownSeconds,
+    breakerMaxCooldownSeconds,
+    maxRateLimitBackoffSeconds,
     connection,
     telemetry,
     userAgent,
@@ -261,10 +324,36 @@ export abstract class BaseDataSource<
       datasourceSettings.datasourceRateLimitDuration,
     );
 
+    const resolvedBreakerThreshold =
+      datasourceSettings.datasourceBreakerThreshold ?? breakerThreshold ?? 5;
+    const resolvedBreakerCooldownSeconds =
+      datasourceSettings.datasourceBreakerCooldownSeconds ??
+      breakerCooldownSeconds ??
+      300;
+    const resolvedBreakerMaxCooldownSeconds =
+      datasourceSettings.datasourceBreakerMaxCooldownSeconds ??
+      breakerMaxCooldownSeconds ??
+      7200;
+    this.#maxRateLimitBackoffMs =
+      (datasourceSettings.datasourceMaxRateLimitBackoffSeconds ??
+        maxRateLimitBackoffSeconds ??
+        300) * 1000;
+
     this.#queueId = `${pluginSymbol.description ?? "unknown"}-${this.serviceName}-fetch-queue`;
     this.queue = new Queue(this.#queueId, {
       connection,
       telemetry,
+    });
+
+    // The breaker persists its state in Redis, namespaced by the fetch queue
+    // id, and shares the queue's connection (`queue.client`). It therefore
+    // survives process restarts and is scoped per datasource.
+    this.#circuitBreaker = new DatasourceCircuitBreaker({
+      client: this.queue.client,
+      keyPrefix: this.queue.toKey("circuit-breaker"),
+      threshold: resolvedBreakerThreshold,
+      baseCooldownMs: resolvedBreakerCooldownSeconds * 1000,
+      maxCooldownMs: resolvedBreakerMaxCooldownSeconds * 1000,
     });
 
     this.#queueEvents = new QueueEvents(this.#queueId, { connection });
@@ -273,6 +362,30 @@ export abstract class BaseDataSource<
       this.#queueId,
       async (job, _token, signal) => {
         await job.log(`Processing request for ${job.data.path}`);
+
+        // Circuit-breaker gate — runs BEFORE any HTTP work. If the breaker is
+        // open, re-freeze the queue for the REMAINING cooldown and re-queue the
+        // job WITHOUT touching its `rateLimitRetries` budget: a breaker wait is
+        // the queue's condition, not this item's fault, so when the breaker
+        // closes items resume with their retry budget intact.
+        //
+        // This throw happens outside the try/catch below, so it never reaches
+        // the real-429 handling that increments `rateLimitRetries`. BullMQ
+        // re-queues any error whose message is the rate-limit sentinel without
+        // consuming an attempt, and sets the worker's local backoff from the
+        // limiter key's PTTL (which we just set via `queue.rateLimit`).
+        const remainingCooldownMs =
+          await this.#circuitBreaker.remainingCooldownMs();
+
+        if (remainingCooldownMs > 0) {
+          await this.queue.rateLimit(remainingCooldownMs);
+
+          this.logger.debug(
+            `[${this.serviceName}] circuit breaker OPEN — deferring ${job.data.path} for ${Duration.fromMillis(remainingCooldownMs).rescale().toHuman()}`,
+          );
+
+          throw Worker.RateLimitError();
+        }
 
         try {
           const {
@@ -302,6 +415,16 @@ export abstract class BaseDataSource<
           await job.log(
             `Request completed in ${(timeTaken / 1000).toFixed(2)} seconds`,
           );
+
+          // A successful (2xx) upstream response resets the consecutive-429
+          // counter and, after sustained success, de-escalates the breaker.
+          const recovery = await this.#circuitBreaker.recordSuccess();
+
+          if (recovery.recovered) {
+            this.logger.info(
+              `[${this.serviceName}] circuit breaker CLOSED — recovered after ${CIRCUIT_BREAKER_SUCCESS_STREAK_TO_RESET_LEVEL.toString()} consecutive successful responses`,
+            );
+          }
 
           return {
             success: true,
@@ -681,16 +804,11 @@ export abstract class BaseDataSource<
     }
 
     if (response.status === 429) {
-      const defaultWaitMs = 10_000;
-      const waitMs = this.#parseRetryAfterHeader(
+      const retryAfterMs = this.#parseRetryAfterHeader(
         response.headers.get("Retry-After") ?? "",
       );
 
-      await this.didEncounterRateLimit(
-        request,
-        response,
-        waitMs === null || waitMs <= 0 ? defaultWaitMs : waitMs,
-      );
+      await this.didEncounterRateLimit(request, response, retryAfterMs);
     }
 
     throw new DataSourceHTTPError(response);
@@ -726,17 +844,59 @@ export abstract class BaseDataSource<
     });
   }
 
+  /**
+   * The escalating per-request backoff, in ms, applied to a 429 that carries no
+   * (or an invalid) `Retry-After` header: starts at 10s and doubles per
+   * consecutive 429, capped at {@link #maxRateLimitBackoffMs}.
+   *
+   * This replaces the previous flat 10s default, which — combined with an
+   * unbounded backfill backlog — produced a queue-level "metronome" of exactly
+   * one request every 10s that kept a per-IP ban permanently refreshed.
+   */
+  protected escalatingBackoffMs(consecutive429s: number): number {
+    const baseMs = 10_000;
+    const exponent = Math.min(30, Math.max(0, consecutive429s - 1));
+
+    return Math.min(baseMs * 2 ** exponent, this.#maxRateLimitBackoffMs);
+  }
+
   protected didEncounterRateLimit(
     _request: RequestOptions,
     response: DataSourceFetchResult<unknown>["response"],
-    waitMs: number,
+    retryAfterMs: number | null,
   ): Promisable<void>;
 
   protected async didEncounterRateLimit(
     _request: RequestOptions,
     response: DataSourceFetchResult<unknown>["response"],
-    waitMs: number,
+    retryAfterMs: number | null,
   ): Promise<void> {
+    // Record the 429 against the circuit breaker. This both drives the
+    // trip/escalation logic and returns the running consecutive-429 count used
+    // to scale the no-`Retry-After` backoff.
+    const { consecutive429s, tripped, cooldownMs, level } =
+      await this.#circuitBreaker.recordRateLimit();
+
+    if (tripped) {
+      // Freeze the ENTIRE queue for the full cooldown immediately; subsequent
+      // jobs re-freeze for the remaining time via the breaker gate at the top
+      // of the processor.
+      await this.queue.rateLimit(cooldownMs);
+
+      this.logger.warn(
+        `[${this.serviceName}] circuit breaker OPEN after ${consecutive429s.toString()} consecutive 429s — cooling down for ${Duration.fromMillis(cooldownMs).rescale().toHuman()} (escalation level ${level.toString()})`,
+      );
+
+      throw Worker.RateLimitError();
+    }
+
+    // Honour a valid `Retry-After` as-is; otherwise apply the escalating
+    // backoff so gaps the breaker does not cover still avoid a fixed cadence.
+    const waitMs =
+      retryAfterMs !== null && retryAfterMs > 0
+        ? retryAfterMs
+        : this.escalatingBackoffMs(consecutive429s);
+
     await this.queue.rateLimit(waitMs);
 
     const formattedWaitTime = Duration.fromMillis(waitMs).rescale().toHuman();
