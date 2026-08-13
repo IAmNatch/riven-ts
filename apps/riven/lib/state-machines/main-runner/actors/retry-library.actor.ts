@@ -10,9 +10,18 @@ import { logger } from "../../../utilities/logger/logger.ts";
 import type { ProcessMediaItemFlow } from "../../../message-queue/flows/process-media-item/process-media-item.schema.ts";
 import type { MediaItem } from "@repo/util-plugin-sdk/dto/entities";
 
+/**
+ * Returns the flow step an item should resume from, or `undefined` if the item
+ * is not in a processable state.
+ *
+ * `getMediaItemsToRetry` only ever returns indexed/scraped/partially_completed
+ * items, but shows fan out through `getIncompleteItems()` and a child may be in
+ * any state. Those children are skipped rather than treated as an error — if
+ * this threw, one unprocessable child would abort the whole sweep.
+ */
 function getMediaItemStep(
   item: MediaItem,
-): ProcessMediaItemFlow["input"]["step"] {
+): ProcessMediaItemFlow["input"]["step"] | undefined {
   switch (item.state) {
     case "partially_completed":
     case "indexed": {
@@ -26,7 +35,7 @@ function getMediaItemStep(
     case "completed":
     case "paused":
     case "unreleased": {
-      throw new Error(`Unexpected media item state: ${item.state}`);
+      return undefined;
     }
   }
 }
@@ -70,9 +79,19 @@ export const retryLibrary = fromPromise(async () => {
           : await item.getIncompleteItems();
 
       for (const itemToProcess of itemsToProcess) {
+        const step = getMediaItemStep(itemToProcess);
+
+        if (!step) {
+          logger.verbose(
+            `Skipping retry for ${itemToProcess.id}: state ${itemToProcess.state} is not processable`,
+          );
+
+          continue;
+        }
+
         await enqueueProcessMediaItem({
           id: itemToProcess.id,
-          step: getMediaItemStep(itemToProcess),
+          step,
           fanOut: false,
         });
       }
