@@ -24,6 +24,9 @@ export const sentryMetaFormat = format((info) => {
       `Unexpected error whilst logging "${info.message as string}": ${error instanceof Error ? error.message : String(error)}`,
     );
 
-    throw error;
+    // Deliberately not rethrown. A log call must never fail its caller: the VFS
+    // logs from error handlers that still have to reply to the kernel, and a
+    // throw here skipped the FUSE callback and hung the read forever.
+    return info;
   }
 });
