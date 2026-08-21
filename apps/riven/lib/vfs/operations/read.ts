@@ -238,10 +238,14 @@ export const readSync = function readSync(
       return;
     }
 
-    logger.error(`Unexpected VFS read error for path: ${path}`, {
-      err: error,
-    });
-
-    process.nextTick(callback, Fuse.EIO);
+    // The kernel stays blocked on this read until the callback fires, so
+    // logging must never be able to stop it from running.
+    try {
+      logger.error(`Unexpected VFS read error for path: ${path}`, {
+        err: error,
+      });
+    } finally {
+      process.nextTick(callback, Fuse.EIO);
+    }
   });
 } satisfies OPERATIONS["read"];
