@@ -5,6 +5,7 @@ import {
   Show,
 } from "@repo/util-plugin-sdk/dto/entities";
 
+import { ENTRY_RESOLUTION_ORDER } from "./entry-resolution-order.ts";
 import { getVfsSubtitleEntry } from "./get-vfs-subtitle-entry.ts";
 
 import type { PathInfo } from "../schemas/path-info.schema.ts";
@@ -38,7 +39,10 @@ export async function getEntry(em: EntityManager, pathInfo: PathInfo) {
             },
           }),
         },
-        { fields: ["createdAt", "updatedAt", "filesystemEntries.fileSize"] },
+        {
+          fields: ["createdAt", "updatedAt", "filesystemEntries.fileSize"],
+          orderBy: ENTRY_RESOLUTION_ORDER,
+        },
       );
     }
     case "single-episode": {
@@ -64,7 +68,10 @@ export async function getEntry(em: EntityManager, pathInfo: PathInfo) {
             },
           },
         },
-        { fields: ["createdAt", "updatedAt", "filesystemEntries.fileSize"] },
+        {
+          fields: ["createdAt", "updatedAt", "filesystemEntries.fileSize"],
+          orderBy: ENTRY_RESOLUTION_ORDER,
+        },
       );
     }
     case "show-seasons": {
@@ -75,7 +82,7 @@ export async function getEntry(em: EntityManager, pathInfo: PathInfo) {
       return em.findOneOrFail(
         Show,
         { tvdbId: pathInfo.tvdbId },
-        { fields: ["createdAt", "updatedAt"] },
+        { fields: ["createdAt", "updatedAt"], orderBy: ENTRY_RESOLUTION_ORDER },
       );
     }
     case "season-episodes": {
@@ -93,7 +100,7 @@ export async function getEntry(em: EntityManager, pathInfo: PathInfo) {
           },
           number: pathInfo.season,
         },
-        { fields: ["createdAt", "updatedAt"] },
+        { fields: ["createdAt", "updatedAt"], orderBy: ENTRY_RESOLUTION_ORDER },
       );
     }
     case "all-movies":
