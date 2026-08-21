@@ -1,5 +1,7 @@
 import { MediaEntry } from "@repo/util-plugin-sdk/dto/entities";
 
+import { ENTRY_RESOLUTION_ORDER } from "./entry-resolution-order.ts";
+
 import type { PathInfo } from "../schemas/path-info.schema.ts";
 import type { EntityManager, FindOneOptions } from "@mikro-orm/core";
 
@@ -21,7 +23,7 @@ export async function getVfsMediaEntry<
           tmdbId: pathInfo.tmdbId,
         },
       },
-      options,
+      { ...options, orderBy: ENTRY_RESOLUTION_ORDER },
     );
   }
 
@@ -38,7 +40,7 @@ export async function getVfsMediaEntry<
           },
         },
       },
-      options,
+      { ...options, orderBy: ENTRY_RESOLUTION_ORDER },
     );
   }
 

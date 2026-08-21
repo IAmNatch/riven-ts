@@ -13,18 +13,29 @@ import { DateTime } from "luxon";
 import { FuseError } from "../../../../vfs/errors/fuse-error.ts";
 import { PathInfo } from "../schemas/path-info.schema.ts";
 import { PersistentDirectory } from "../schemas/persistent-directory.schema.ts";
+import { getVfsMediaEntry } from "./get-vfs-media-entry.ts";
 import { getEntry } from "./get-vfs-path-entry.ts";
 import { stat } from "./stat.ts";
 
 import type { EntityManager } from "@mikro-orm/core";
 
-async function getEntryFileSize(entry: Movie | Episode | SubtitleEntry) {
+/**
+ * Resolves the size `getattr` reports for a file path.
+ *
+ * For media files this deliberately goes through {@link getVfsMediaEntry} - the
+ * exact resolver `open` uses - rather than reading the size off the collection of
+ * the entity `getEntry` happened to return. A path can match several media items,
+ * each owning its own entry for a different release, so resolving the size and the
+ * bytes independently let `stat` describe one file while `read` served another.
+ * Sharing one resolver keeps the reported size and the served bytes in agreement.
+ */
+async function getEntryFileSize(
+  em: EntityManager,
+  pathInfo: PathInfo,
+  entry: Movie | Episode | SubtitleEntry,
+) {
   if (entry instanceof Movie || entry instanceof Episode) {
-    const [mediaEntry] = await entry.filesystemEntries.matching({
-      where: {
-        type: "media",
-      },
-    });
+    const mediaEntry = await getVfsMediaEntry(em, pathInfo);
 
     return mediaEntry?.fileSize ?? 0;
   }
@@ -264,7 +275,7 @@ export async function getVfsEntryStat(em: EntityManager, path: string) {
       mtime: entry.updatedAt ?? entry.createdAt,
       ...(isFileEntry && pathInfo.data.isFile
         ? {
-            size: await getEntryFileSize(entry),
+            size: await getEntryFileSize(em, pathInfo.data, entry),
             mode: "file",
           }
         : { mode: "dir" }),
