@@ -6,8 +6,10 @@ import { Buffer } from "node:buffer";
 
 import { logger } from "../../../utilities/logger/logger.ts";
 import { FuseError } from "../../errors/fuse-error.ts";
+import { StalledStreamError } from "../../errors/stalled-stream.ts";
 import { chunkCache } from "../chunk-cache.ts";
 import { waitForChunk } from "../chunks/wait-for-chunk.ts";
+import { discardFdStream } from "../discard-fd-stream.ts";
 import { createStreamRequest } from "../requests/create-stream-request.ts";
 import { seek } from "../seek.ts";
 import { getVfsOperationContext } from "../vfs-operation-context.ts";
@@ -56,7 +58,7 @@ export async function performBodyRead(chunks: readonly ChunkMetadata[]) {
     seek(currentStreamPosition, chunkAlignedStart);
   }
 
-  const streamReader =
+  let streamReader =
     (await responsePromise) ??
     (await createStreamRequest(fileHandleMetadata.url, [
       chunkAlignedStart,
@@ -66,26 +68,60 @@ export async function performBodyRead(chunks: readonly ChunkMetadata[]) {
   const { timeTaken, result } = await benchmark(async () => {
     const fetchedChunks: Buffer[] = [];
     const fetchedChunksMetadata: ChunkMetadata[] = [];
+    const pendingChunks = [...missingChunksMetadata];
 
     let bytesFetched = 0;
+    let hasReconnected = false;
 
-    for (const targetChunk of missingChunksMetadata) {
-      const { chunk, fetchedFromCache } = await waitForChunk(
-        streamReader.body,
-        targetChunk,
-      );
+    while (pendingChunks[0]) {
+      const targetChunk = pendingChunks[0];
 
-      if (!fetchedFromCache) {
-        logger.silly(`Fetched chunk ${targetChunk.rangeLabel}`);
+      try {
+        const { chunk, fetchedFromCache } = await waitForChunk(
+          streamReader.body,
+          targetChunk,
+        );
 
-        bytesFetched += chunk.byteLength;
+        if (!fetchedFromCache) {
+          logger.silly(`Fetched chunk ${targetChunk.rangeLabel}`);
 
-        fetchedChunksMetadata.push(targetChunk);
+          bytesFetched += chunk.byteLength;
+
+          fetchedChunksMetadata.push(targetChunk);
+        }
+
+        fetchedChunks.push(chunk);
+
+        chunkCache.set(targetChunk.cacheKey, chunk);
+
+        pendingChunks.shift();
+      } catch (error) {
+        // A stalled body never recovers on its own, and the stream is cached
+        // against the file descriptor - so every later read would be handed the
+        // same dead stream and time out in turn, one timeout per read, until the
+        // player gave up and reopened the file. Drop it and reconnect from the
+        // chunk that stalled instead, which the caller never has to see.
+        //
+        // Only once: if the replacement stalls at the same chunk the upstream is
+        // not simply dropping a connection, and retrying would just stack more
+        // timeouts in front of the player.
+        if (hasReconnected || !(error instanceof StalledStreamError)) {
+          throw error;
+        }
+
+        hasReconnected = true;
+
+        logger.warn(
+          `Stream stalled for fd ${fd.toString()} at chunk ${targetChunk.rangeLabel}; reconnecting.`,
+        );
+
+        discardFdStream(fd, streamReader);
+
+        streamReader = await createStreamRequest(fileHandleMetadata.url, [
+          targetChunk.range[0],
+          undefined,
+        ]);
       }
-
-      fetchedChunks.push(chunk);
-
-      chunkCache.set(targetChunk.cacheKey, chunk);
     }
 
     return {
