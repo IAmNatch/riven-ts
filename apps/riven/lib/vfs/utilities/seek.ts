@@ -1,8 +1,5 @@
 import { logger } from "../../utilities/logger/logger.ts";
-import {
-  fdToCurrentStreamPositionMap,
-  fdToResponsePromiseMap,
-} from "./file-handle-map.ts";
+import { discardFdStream } from "./discard-fd-stream.ts";
 import { getVfsOperationContext } from "./vfs-operation-context.ts";
 
 /**
@@ -23,11 +20,7 @@ export function seek(from: number, to: number) {
     `Seeking to new start position for fd ${fd.toString()} (${from.toString()} -> ${to.toString()})`,
   );
 
-  // Drain without blocking. We don't want a slow or large stream to delay the reconnect.
-  void responsePromise?.then(async ({ body }) => body.dump());
-
-  fdToResponsePromiseMap.delete(fd);
-  fdToCurrentStreamPositionMap.delete(fd);
+  discardFdStream(fd, responsePromise);
 
   seekController.abort();
 }
