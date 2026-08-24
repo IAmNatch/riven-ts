@@ -37,7 +37,16 @@ async function getEntryFileSize(
   if (entry instanceof Movie || entry instanceof Episode) {
     const mediaEntry = await getVfsMediaEntry(em, pathInfo);
 
-    return mediaEntry?.fileSize ?? 0;
+    // `getEntry` resolves the media *item* from the ids in the path, so it
+    // happily returns one for any filename sitting in the right directory. Only
+    // the resolver can say whether this exact path is a file, so a miss here is
+    // ENOENT rather than a zero-byte file - reporting success for a path that
+    // cannot be opened leaves callers believing a deleted file still exists.
+    if (!mediaEntry) {
+      throw new FuseError(Fuse.ENOENT, "No media entry found");
+    }
+
+    return mediaEntry.fileSize;
   }
 
   return entry.fileSize;
