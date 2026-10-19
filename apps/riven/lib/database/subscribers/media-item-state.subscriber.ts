@@ -95,6 +95,7 @@ export class MediaItemStateSubscriber implements EventSubscriber<MediaItem> {
     }
 
     const seasonsAwaitingUpdate = new Set<Season>();
+    const seasonsWithNewlyReleasedEpisodes = new Set<Season>();
     const showsAwaitingUpdate = new Set<Show>();
     const nextStatesMap: NextStatesMap = new Map();
 
@@ -123,6 +124,8 @@ export class MediaItemStateSubscriber implements EventSubscriber<MediaItem> {
         continue;
       }
 
+      const wasUnreleased = item.state === "unreleased";
+
       const stateChanged = await this.#maybeUpdateState(
         item,
         changeSet,
@@ -139,11 +142,19 @@ export class MediaItemStateSubscriber implements EventSubscriber<MediaItem> {
       }
 
       if (item instanceof Episode) {
-        seasonsAwaitingUpdate.add(await item.season.loadOrFail());
+        const season = await item.season.loadOrFail();
+
+        seasonsAwaitingUpdate.add(season);
+
+        if (wasUnreleased) {
+          seasonsWithNewlyReleasedEpisodes.add(season);
+        }
       }
     }
 
     for (const episode of episodesAwaitingUpdate) {
+      const wasUnreleased = episode.state === "unreleased";
+
       const stateChanged = await this.#maybeUpdateState(
         episode,
         trackedItems.get(episode) ?? undefined,
@@ -152,7 +163,26 @@ export class MediaItemStateSubscriber implements EventSubscriber<MediaItem> {
       );
 
       if (stateChanged) {
-        seasonsAwaitingUpdate.add(await episode.season.loadOrFail());
+        const season = await episode.season.loadOrFail();
+
+        seasonsAwaitingUpdate.add(season);
+
+        if (wasUnreleased) {
+          seasonsWithNewlyReleasedEpisodes.add(season);
+        }
+      }
+    }
+
+    // Each newly released episode gets a fresh scrape budget for its season.
+    // Without this, an airing season accumulates a failed attempt for every
+    // scrape that runs before the latest episode is uploaded, until it
+    // exhausts maximumFailedAttempts and later episodes are never scraped.
+    const seasonsWithResetScrapeAttempts = new Set<Season>();
+
+    for (const season of seasonsWithNewlyReleasedEpisodes) {
+      if (await this.#resetFailedScrapeAttempts(season)) {
+        seasonsWithResetScrapeAttempts.add(season);
+        showsAwaitingUpdate.add(await season.show.loadOrFail());
       }
     }
 
@@ -179,6 +209,59 @@ export class MediaItemStateSubscriber implements EventSubscriber<MediaItem> {
         nextStatesMap,
       );
     }
+
+    // The state propagation above only persists items whose state changed,
+    // so make sure the reset scrape counters are flushed as well.
+    for (const season of seasonsWithResetScrapeAttempts) {
+      const show = await season.show.loadOrFail();
+
+      for (const item of [season, show]) {
+        const hasChangeSet = uow
+          .getChangeSets()
+          .some((changeSet) => changeSet.entity === item);
+
+        if (hasChangeSet) {
+          uow.recomputeSingleChangeSet(item);
+        } else {
+          uow.computeChangeSet(item);
+        }
+      }
+    }
+  }
+
+  /**
+   * Gives a season a fresh scrape budget after one of its episodes is released.
+   *
+   * A season that had exhausted its attempts may be fixed in the `failed` state
+   * (and its show with it), so those are moved back to `indexed` to let the
+   * state propagation recompute them from their episodes.
+   *
+   * @returns `true` if the season was changed.
+   */
+  async #resetFailedScrapeAttempts(season: Season): Promise<boolean> {
+    if (season.failedScrapeAttempts === 0 && season.state !== "failed") {
+      return false;
+    }
+
+    const { logger } = await import("../../utilities/logger/logger.ts");
+
+    logger.info(
+      `New episode released for ${chalk.bold(season.fullTitle)}; resetting ${season.failedScrapeAttempts.toString()} failed scrape attempts`,
+    );
+
+    season.failedScrapeAttempts = 0;
+
+    if (season.state === "failed") {
+      season.state = "indexed";
+
+      const show = await season.show.loadOrFail();
+
+      if (show.state === "failed") {
+        show.state = "indexed";
+      }
+    }
+
+    return true;
   }
 
   async #computeNextState(
