@@ -1,8 +1,9 @@
-import { MediaItem } from "@repo/util-plugin-sdk/dto/entities";
+import { MediaItem, Season } from "@repo/util-plugin-sdk/dto/entities";
 import { parse } from "@repo/util-rank-torrent-name/parser";
 
 import { faker } from "@faker-js/faker";
 import { Worker } from "bullmq";
+import { DateTime } from "luxon";
 import { expect, onTestFinished, vi } from "vitest";
 
 import { it } from "../../../__tests__/test-context.ts";
@@ -190,4 +191,120 @@ it("fails the item after maximumFailedAttempts scrapes that all find nothing", a
 
   expect(item.state).toBe("failed");
   expect(item.failedScrapeAttempts).toBe(3);
+});
+
+it("scrapes an exhausted season again once a new episode airs, and proceeds to download", async ({
+  em,
+  factories: { showFactory, seasonFactory, episodeFactory, mediaEntryFactory },
+  mockFlowProcessorContext: { plugins },
+  createPluginWorker,
+}) => {
+  const now = DateTime.utc().startOf("minute");
+  const airDate = now.plus({ days: 1 });
+  const indexedAt = now.toJSDate();
+
+  const show = await showFactory.createOne({
+    status: "continuing",
+    releaseDate: now.minus({ weeks: 2 }).toJSDate(),
+    indexedAt,
+  });
+
+  const season = await seasonFactory.createOne({
+    show,
+    itemRequest: show.itemRequest,
+    number: 1,
+    releaseDate: now.minus({ weeks: 2 }).toJSDate(),
+    indexedAt,
+  });
+
+  const completedEpisode = await episodeFactory.createOne({
+    season,
+    show,
+    itemRequest: show.itemRequest,
+    number: 1,
+    releaseDate: now.minus({ weeks: 1 }).toJSDate(),
+    indexedAt,
+  });
+
+  completedEpisode.filesystemEntries.add(
+    mediaEntryFactory.makeOne({ mediaItem: completedEpisode }),
+  );
+
+  const newEpisode = await episodeFactory.createOne({
+    season,
+    show,
+    itemRequest: show.itemRequest,
+    number: 2,
+    releaseDate: airDate.toJSDate(),
+    indexedAt,
+  });
+
+  // Every scrape before the new episode was uploaded counted as a failure.
+  season.failedScrapeAttempts = settings.maximumFailedAttempts;
+
+  await em.flush();
+
+  expect(season.state).toBe("partially_completed");
+  expect(newEpisode.state).toBe("unreleased");
+
+  const infoHash = faker.git.commitSha();
+
+  const { pluginScrape } = startScrapeRetryHarness(
+    plugins,
+    createPluginWorker,
+    () => ({ [infoHash]: `${show.title} S01E02 1080p WEB-DL` }),
+  );
+
+  const [exhaustedJob] =
+    (await enqueueProcessMediaItem({ id: season.id, fanOut: false })) ?? [];
+
+  expect.assert(exhaustedJob);
+
+  await expect(runSingleJob(exhaustedJob.job)).rejects.toThrow(
+    /has exhausted all scrape attempts/u,
+  );
+
+  expect(pluginScrape).not.toHaveBeenCalled();
+
+  // The new episode airs. Only `Date` is faked so BullMQ keeps real timers.
+  vi.useFakeTimers({
+    toFake: ["Date"],
+    now: airDate.plus({ hours: 1 }).toJSDate(),
+  });
+
+  newEpisode.year = null; // Trigger a change on the entity to update the state
+
+  await em.flush();
+
+  vi.useRealTimers();
+
+  expect(newEpisode.state).toBe("indexed");
+
+  await expect(
+    em.fork().findOneOrFail(Season, season.id),
+  ).resolves.toMatchObject({ failedScrapeAttempts: 0 });
+
+  await enqueueProcessMediaItem({ id: season.id, fanOut: false });
+
+  await vi.waitFor(
+    async () => {
+      const downloadJobs = await createQueue("download-item").getJobs();
+
+      expect(downloadJobs.map(({ data }) => data)).toStrictEqual([
+        { id: season.id },
+      ]);
+    },
+    { timeout: 10_000, interval: 100 },
+  );
+
+  expect(pluginScrape).toHaveBeenCalledOnce();
+
+  const scrapedSeason = await em
+    .fork()
+    .findOneOrFail(Season, season.id, { populate: ["streams"] });
+
+  expect(scrapedSeason.failedScrapeAttempts).toBe(0);
+  expect(
+    scrapedSeason.streams.getItems().map(({ infoHash: hash }) => hash),
+  ).toStrictEqual([infoHash]);
 });
