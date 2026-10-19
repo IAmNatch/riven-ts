@@ -10,6 +10,13 @@ export const ScrapeItemFlow = createFlowSchema("scrape-item", {
   children: ParseScrapeResultsSandboxedJob.shape.output,
   input: z.object({
     id: UUID,
+    /**
+     * The attempt (`job.attemptsMade`) that the current set of plugin scrape
+     * children was created for. When BullMQ retries the job, `attemptsMade` moves
+     * past this and the processor enqueues fresh children before reading results.
+     * Absent on the first attempt (and on jobs enqueued before this field existed).
+     */
+    scrapeAttempt: z.int().nonnegative().optional(),
   }),
 });
 
