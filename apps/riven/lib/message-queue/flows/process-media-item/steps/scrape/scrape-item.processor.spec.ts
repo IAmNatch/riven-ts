@@ -2,7 +2,7 @@ import { Movie } from "@repo/util-plugin-sdk/dto/entities";
 import { parse } from "@repo/util-rank-torrent-name/parser";
 
 import { faker } from "@faker-js/faker";
-import { UnrecoverableError } from "bullmq";
+import { UnrecoverableError, WaitingChildrenError } from "bullmq";
 import { randomUUID } from "node:crypto";
 import { expect, vi } from "vitest";
 
@@ -177,4 +177,105 @@ it('sends a "riven.media-item.scrape.success" event with the updated item if the
     type: "riven.media-item.scrape.success",
     item: expect.any(Movie),
   });
+});
+
+it("enqueues fresh plugin scrapes instead of re-reading the previous attempt's results when the job is retried", async ({
+  createMockJob,
+  mockSentryScope,
+  mockFlowProcessorContext,
+  seeders: { seedIndexedMovie },
+}) => {
+  const indexedMovie = await seedIndexedMovie();
+
+  const job = await createMockJob({ id: indexedMovie.movie.id });
+
+  job.attemptsMade = 1;
+
+  const getChildrenValues = vi.spyOn(job, "getChildrenValues");
+  const moveToWaitingChildren = vi
+    .spyOn(job, "moveToWaitingChildren")
+    .mockResolvedValue(true);
+  const scrapeItem = vi.spyOn(
+    mockFlowProcessorContext.services.scraperService,
+    "scrapeItem",
+  );
+
+  await expect(
+    scrapeItemProcessor(
+      { job, token: "token", scope: mockSentryScope },
+      mockFlowProcessorContext,
+    ),
+  ).rejects.toThrow(WaitingChildrenError);
+
+  expect(moveToWaitingChildren).toHaveBeenCalledWith("token");
+  expect(getChildrenValues).not.toHaveBeenCalled();
+  expect(scrapeItem).not.toHaveBeenCalled();
+  expect(job.data).toStrictEqual({
+    id: indexedMovie.movie.id,
+    scrapeAttempt: 1,
+  });
+
+  const { unprocessed = [] } = await job.getDependencies();
+
+  expect(unprocessed).toStrictEqual([
+    expect.stringContaining(":scrape-item.parse-scrape-results:"),
+  ]);
+});
+
+it("processes the results of the current attempt once its plugin scrapes have run", async ({
+  createMockJob,
+  createMockJobChildKey,
+  mockSentryScope,
+  mockFlowProcessorContext,
+  seeders: { seedIndexedMovie },
+}) => {
+  const indexedMovie = await seedIndexedMovie();
+
+  const job = await createMockJob({
+    id: indexedMovie.movie.id,
+    scrapeAttempt: 1,
+  });
+
+  job.attemptsMade = 1;
+
+  const moveToWaitingChildren = vi.spyOn(job, "moveToWaitingChildren");
+
+  vi.spyOn(job, "getChildrenValues").mockResolvedValue({
+    [createMockJobChildKey("scrape-item.parse-scrape-results")]: {
+      id: indexedMovie.movie.id,
+      results: {
+        [faker.git.commitSha()]: parse("Test Movie 2024 1080p WEB-DL"),
+      },
+    },
+  });
+
+  await scrapeItemProcessor(
+    { job, token: "token", scope: mockSentryScope },
+    mockFlowProcessorContext,
+  );
+
+  expect(moveToWaitingChildren).not.toHaveBeenCalled();
+  expect(mockFlowProcessorContext.sendEvent).toHaveBeenCalledWith({
+    type: "riven.media-item.scrape.success",
+    item: expect.any(Movie),
+  });
+});
+
+it("throws an UnrecoverableError if the item cannot be found when the job is retried", async ({
+  createMockJob,
+  mockSentryScope,
+  mockFlowProcessorContext,
+}) => {
+  const job = await createMockJob({ id: randomUUID() });
+
+  job.attemptsMade = 1;
+
+  await expect(
+    scrapeItemProcessor(
+      { job, token: "token", scope: mockSentryScope },
+      mockFlowProcessorContext,
+    ),
+  ).rejects.toThrow(
+    new UnrecoverableError(`MediaItem with id ${job.data.id} not found`),
+  );
 });
