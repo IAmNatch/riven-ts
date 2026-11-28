@@ -10,6 +10,10 @@ import { StalledStreamError } from "../../errors/stalled-stream.ts";
 import { chunkCache } from "../chunk-cache.ts";
 import { waitForChunk } from "../chunks/wait-for-chunk.ts";
 import { discardFdStream } from "../discard-fd-stream.ts";
+import {
+  fdToCurrentStreamPositionMap,
+  fdToResponsePromiseMap,
+} from "../file-handle-map.ts";
 import { createStreamRequest } from "../requests/create-stream-request.ts";
 import { seek } from "../seek.ts";
 import { getVfsOperationContext } from "../vfs-operation-context.ts";
@@ -58,12 +62,10 @@ export async function performBodyRead(chunks: readonly ChunkMetadata[]) {
     seek(currentStreamPosition, chunkAlignedStart);
   }
 
-  let streamReader =
-    (await responsePromise) ??
-    (await createStreamRequest(fileHandleMetadata.url, [
-      chunkAlignedStart,
-      undefined,
-    ]));
+  let streamPromise =
+    responsePromise ??
+    createStreamRequest(fileHandleMetadata.url, [chunkAlignedStart, undefined]);
+  let streamReader = await streamPromise;
 
   const { timeTaken, result } = await benchmark(async () => {
     const fetchedChunks: Buffer[] = [];
@@ -111,16 +113,38 @@ export async function performBodyRead(chunks: readonly ChunkMetadata[]) {
 
         hasReconnected = true;
 
-        logger.warn(
-          `Stream stalled for fd ${fd.toString()} at chunk ${targetChunk.rangeLabel}; reconnecting.`,
-        );
+        // FUSE issues several reads into the same chunk at once, so another
+        // read waiting on the same dead stream usually times out alongside this
+        // one and reconnects first. Join its replacement rather than opening a
+        // second: reads on an fd must share one stream. With two, the read that
+        // takes the chunk from the cache leaves the fd's stream unconsumed, and
+        // the next read is served a repeat of this chunk as the one after it.
+        const replacementPromise = fdToResponsePromiseMap.get(fd);
 
-        discardFdStream(fd, streamReader);
+        if (
+          replacementPromise &&
+          replacementPromise !== streamPromise &&
+          fdToCurrentStreamPositionMap.get(fd) === targetChunk.range[0]
+        ) {
+          logger.warn(
+            `Stream stalled for fd ${fd.toString()} at chunk ${targetChunk.rangeLabel}; joining the reconnected stream.`,
+          );
 
-        streamReader = await createStreamRequest(fileHandleMetadata.url, [
-          targetChunk.range[0],
-          undefined,
-        ]);
+          streamPromise = replacementPromise;
+        } else {
+          logger.warn(
+            `Stream stalled for fd ${fd.toString()} at chunk ${targetChunk.rangeLabel}; reconnecting.`,
+          );
+
+          discardFdStream(fd, streamPromise);
+
+          streamPromise = createStreamRequest(fileHandleMetadata.url, [
+            targetChunk.range[0],
+            undefined,
+          ]);
+        }
+
+        streamReader = await streamPromise;
       }
     }
 
